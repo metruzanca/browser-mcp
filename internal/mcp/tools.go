@@ -32,16 +32,20 @@ const (
 	toolScreenshot   = "browser_screenshot"
 	toolRunSnippet   = "browser_run_snippet"
 	toolListSnippets = "browser_list_snippets"
+	toolSetTarget    = "browser_set_target"
+	toolGetTarget    = "browser_get_target"
+	toolListWindows  = "browser_list_windows"
+	toolListTabs     = "browser_list_tabs"
 )
 
 const defaultTimeout = 20 * time.Second
 
-// Server wires MCP tools to the bridge that talks to the Chrome extension.
+// Server wires MCP tools to the agent client that talks to the hub.
 type Server struct {
-	br *bridge.Server
+	br *bridge.Client
 }
 
-func New(br *bridge.Server) *Server { return &Server{br: br} }
+func New(br *bridge.Client) *Server { return &Server{br: br} }
 
 func (s *Server) Register(mcpServer *server.MCPServer) {
 	// browser_execute_js — the primary tool.
@@ -249,6 +253,40 @@ func (s *Server) Register(mcpServer *server.MCPServer) {
 			mcp.WithDescription("List every available reusable page script: name + one-line description. See browser_run_snippet."),
 		),
 		s.handleListSnippets,
+	)
+
+	mcpServer.AddTool(
+		mcp.NewTool(toolListWindows,
+			mcp.WithDescription("List Chrome windows: id, whether focused, window type, and the active tab of each. Use this to discover which window to target, then pin this session with browser_set_target."),
+			mcp.WithNumber("tabId", mcp.Description("Chrome tab id. Omit to use the active tab.")),
+		),
+		s.handleListWindows,
+	)
+
+	mcpServer.AddTool(
+		mcp.NewTool(toolListTabs,
+			mcp.WithDescription("List tabs (all windows, or one window): tabId, url, title, active. Use with browser_list_windows to pick a target tab/window."),
+			mcp.WithNumber("windowId", mcp.Description("Restrict to this window. Omit for all windows.")),
+			mcp.WithNumber("tabId", mcp.Description("Chrome tab id. Omit to use the active tab.")),
+		),
+		s.handleListTabs,
+	)
+
+	mcpServer.AddTool(
+		mcp.NewTool(toolSetTarget,
+			mcp.WithDescription("Pin this agent session to a specific tab or window. Once pinned, the session is restricted to that target: other tabs are off-limits until you re-pin or clear. WORKFLOW: before starting browser work, confirm with the user which tab you'll operate on (browser_get_tab shows it), then pin it here — so the user can browse elsewhere without you following the focus. Pass {tabId} to pin a tab, {windowId} to pin a window (its active tab), or {\"clear\": true} to unpin back to dynamic active."),
+			mcp.WithNumber("tabId", mcp.Description("Pin to this exact tab.")),
+			mcp.WithNumber("windowId", mcp.Description("Pin to the active tab of this window.")),
+			mcp.WithBoolean("clear", mcp.Description("Clear the pin and return to dynamic active-tab targeting.")),
+		),
+		s.handleSetTarget,
+	)
+
+	mcpServer.AddTool(
+		mcp.NewTool(toolGetTarget,
+			mcp.WithDescription("Show this session's current pin: {\"kind\":\"active\"} (dynamic, follows the focused window), {\"kind\":\"tab\",\"id\":N}, or {\"kind\":\"window\",\"id\":N}."),
+		),
+		s.handleGetTarget,
 	)
 }
 
@@ -533,6 +571,40 @@ func (s *Server) handleListSnippets(ctx context.Context, req mcp.CallToolRequest
 	return mcp.NewToolResultText(string(b)), nil
 }
 
+func (s *Server) handleListWindows(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return s.callTab(ctx, "listWindows", req, nil)
+}
+
+func (s *Server) handleListTabs(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	params := map[string]any{}
+	if w := req.GetInt("windowId", 0); w > 0 {
+		params["windowId"] = w
+	}
+	return s.callTab(ctx, "listTabs", req, params)
+}
+
+func (s *Server) handleSetTarget(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	params := map[string]any{}
+	tabID := req.GetInt("tabId", 0)
+	windowID := req.GetInt("windowId", 0)
+	if req.GetBool("clear", false) {
+		params["clear"] = true
+	} else if tabID > 0 && windowID > 0 {
+		return mcp.NewToolResultError("provide tabId or windowId, not both"), nil
+	} else if tabID > 0 {
+		params["tabId"] = tabID
+	} else if windowID > 0 {
+		params["windowId"] = windowID
+	} else {
+		return mcp.NewToolResultError("provide tabId, windowId, or clear"), nil
+	}
+	return s.callControl(ctx, "setTarget", params)
+}
+
+func (s *Server) handleGetTarget(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return s.callControl(ctx, "getTarget", nil)
+}
+
 func notConnectedResult() *mcp.CallToolResult {
 	return mcp.NewToolResultError("No browser extension is connected. Open the extension popup in Chrome and click Connect (default ws://127.0.0.1:18765/ws), then try again.")
 }
@@ -543,21 +615,18 @@ func (s *Server) call(ctx context.Context, action string, params map[string]any)
 	defer cancel()
 	reply, err := s.br.Request(cctx, action, params)
 	if err != nil {
-		if err == bridge.ErrNotConnected {
-			return notConnectedResult(), nil
-		}
-		if errors.Is(err, context.DeadlineExceeded) {
-			return mcp.NewToolResultError("The browser did not respond in time (timed out). The extension may be waking up — retry the call."), nil
-		}
-		return mcp.NewToolResultError("Browser bridge error: " + err.Error()), nil
+		return s.mapError(err), nil
 	}
 	if !reply.OK {
+		if reply.Error == bridge.ErrNoExtension.Error() {
+			return notConnectedResult(), nil
+		}
 		return mcp.NewToolResultError(reply.Error), nil
 	}
 	return renderResult(reply.Data), nil
 }
 
-// callTab merges a tabId param into params before calling.
+// callTab merges tabId/windowId params into params before calling.
 func (s *Server) callTab(ctx context.Context, action string, req mcp.CallToolRequest, params map[string]any) (*mcp.CallToolResult, error) {
 	if params == nil {
 		params = map[string]any{}
@@ -565,7 +634,41 @@ func (s *Server) callTab(ctx context.Context, action string, req mcp.CallToolReq
 	if tabID := req.GetInt("tabId", 0); tabID > 0 {
 		params["tabId"] = tabID
 	}
+	if windowID := req.GetInt("windowId", 0); windowID > 0 {
+		params["windowId"] = windowID
+	}
 	return s.call(ctx, action, params)
+}
+
+// callControl sends a hub-side control message.
+func (s *Server) callControl(ctx context.Context, ctrl string, params map[string]any) (*mcp.CallToolResult, error) {
+	cctx, cancel := context.WithTimeout(ctx, defaultTimeout)
+	defer cancel()
+	reply, err := s.br.Control(cctx, ctrl, params)
+	if err != nil {
+		return s.mapError(err), nil
+	}
+	if !reply.OK {
+		if reply.Error == bridge.ErrNoExtension.Error() {
+			return notConnectedResult(), nil
+		}
+		return mcp.NewToolResultError(reply.Error), nil
+	}
+	return renderResult(reply.Data), nil
+}
+
+// mapError translates client errors into friendly tool results.
+func (s *Server) mapError(err error) *mcp.CallToolResult {
+	switch {
+	case errors.Is(err, bridge.ErrNotConnected):
+		return notConnectedResult()
+	case errors.Is(err, bridge.ErrNoHub):
+		return mcp.NewToolResultError("The browser-mcp hub is not reachable and could not be started. Run `browser-mcp daemon` or check port 18765, then retry.")
+	case errors.Is(err, context.DeadlineExceeded):
+		return mcp.NewToolResultError("The browser did not respond in time (timed out). The extension may be waking up — retry the call.")
+	default:
+		return mcp.NewToolResultError("Browser bridge error: " + err.Error())
+	}
 }
 
 func renderResult(data map[string]any) *mcp.CallToolResult {

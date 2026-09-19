@@ -86,8 +86,8 @@ function connect() {
             setTimeout(() => reject(new Error("browser: request timed out after " + REQ_TIMEOUT_MS + "ms")), REQ_TIMEOUT_MS)
           ),
         ]).then(
-          (reply) => sendSafe(Object.assign({ id: msg.id }, reply)),
-          (err) => sendSafe({ id: msg.id, ok: false, error: (err && err.message) || String(err) })
+          (reply) => sendSafe(Object.assign({ id: msg.id, session: msg.session }, reply)),
+          (err) => sendSafe({ id: msg.id, session: msg.session, ok: false, error: (err && err.message) || String(err) })
         );
       }
     };
@@ -166,6 +166,10 @@ async function dispatch(msg) {
         return await captureTab(msg.params);
       case "executeScript":
         return await executeScript(msg.params);
+      case "listWindows":
+        return await listWindows(msg.params);
+      case "listTabs":
+        return await listTabs(msg.params);
       default:
         return { ok: false, error: "Unknown action: " + msg.action };
     }
@@ -174,15 +178,41 @@ async function dispatch(msg) {
   }
 }
 
-async function resolveTab(tabId) {
+// Resolve which tab an action targets, honoring the session pin injected by
+// the hub (pinnedTab/pinnedWindow) plus per-call tabId/windowId. Falls back
+// to the active tab of the focused window.
+async function resolveTargetTab(params) {
+  params = params || {};
+  let tabId = params.tabId;
+  if (params.pinnedTab) {
+    if (tabId && tabId !== params.pinnedTab) {
+      throw new Error(
+        "This session is pinned to tab " + params.pinnedTab + "; cannot target tab " + tabId + ". Update the pin with browser_set_target."
+      );
+    }
+    tabId = params.pinnedTab;
+  }
+  if (tabId && params.pinnedWindow) {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.windowId !== params.pinnedWindow) {
+      throw new Error(
+        "This session is pinned to window " + params.pinnedWindow + "; tab " + tabId + " is in window " + tab.windowId + ". Update the pin with browser_set_target."
+      );
+    }
+  }
   if (tabId) return tabId;
+  if (params.windowId) {
+    const [tab] = await chrome.tabs.query({ windowId: params.windowId, active: true });
+    if (!tab) throw new Error("No active tab in window " + params.windowId);
+    return tab.id;
+  }
   const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   if (!tab) throw new Error("No active tab found");
   return tab.id;
 }
 
 async function getTabInfo(params) {
-  const tabId = await resolveTab(params && params.tabId);
+  const tabId = await resolveTargetTab(params);
   const tab = await chrome.tabs.get(tabId);
   return {
     ok: true,
@@ -190,6 +220,7 @@ async function getTabInfo(params) {
       url: tab.url || "",
       title: tab.title || "",
       tabId: tab.id,
+      windowId: tab.windowId,
       favIconUrl: tab.favIconUrl || "",
       status: tab.status || "",
     },
@@ -197,14 +228,44 @@ async function getTabInfo(params) {
 }
 
 async function captureTab(params) {
-  const tabId = await resolveTab(params && params.tabId);
+  const tabId = await resolveTargetTab(params);
   const tab = await chrome.tabs.get(tabId);
   const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
   return { ok: true, data: { dataUrl: dataUrl } };
 }
 
+async function listWindows() {
+  const wins = await chrome.windows.getAll({ populate: false });
+  const out = [];
+  for (const w of wins) {
+    let active = null;
+    try {
+      const tabs = await chrome.tabs.query({ windowId: w.id, active: true });
+      active = tabs[0]
+        ? { tabId: tabs[0].id, url: tabs[0].url || "", title: tabs[0].title || "" }
+        : null;
+    } catch (e) {}
+    out.push({ windowId: w.id, focused: !!w.focused, type: w.type || "", state: w.state || "", activeTab: active });
+  }
+  return { ok: true, data: { windows: out } };
+}
+
+async function listTabs(params) {
+  const q = params && params.windowId ? { windowId: params.windowId } : {};
+  const tabs = await chrome.tabs.query(q);
+  const out = tabs.map((t) => ({
+    tabId: t.id,
+    windowId: t.windowId,
+    url: t.url || "",
+    title: t.title || "",
+    active: !!t.active,
+    pinned: !!t.pinned,
+  }));
+  return { ok: true, data: { tabs: out } };
+}
+
 async function executeScript(params) {
-  const tabId = await resolveTab(params && params.tabId);
+  const tabId = await resolveTargetTab(params);
   const world = (params && params.world) || "main";
   const payload = {
     code: (params && params.code) || "",
@@ -259,7 +320,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       if (msg && msg.type === "getStatus") {
         let tab = null;
         try {
-          const tabId = await resolveTab(null);
+          const tabId = await resolveTargetTab(null);
           const t = await chrome.tabs.get(tabId);
           tab = { url: t.url, title: t.title };
         } catch (e) {}
