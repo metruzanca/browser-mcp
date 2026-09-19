@@ -44,17 +44,19 @@ Most browser automation fights the page. This one hands it to the agent:
 
 ```
 Claude Code / opencode              Chrome browser
-      │  MCP over stdio                    │
-      ▼                                    ▼
-┌─────────────────────┐  loopback WebSocket ┌──────────────────────────┐
-│ Go MCP server        │ ◄───────────────── │ Chrome extension          │
-│  stdio transport     │   req / resp       │  drives the active tab    │
-└─────────────────────┘                    └──────────────────────────┘
+      │  MCP over stdio                   │
+      ▼                                   ▼
+┌──────────────┐  agent WS   ┌────────────────────┐  extension WS  ┌─────────────┐
+│ MCP instance │ ──────────► │  browser-mcp hub   │ ◄───────────── │ extension    │
+│ (stdio)      │ ──────────► │  (127.0.0.1:18765) │                │  (Chrome SW) │
+└──────────────┘  N agents   └────────────────────┘                └─────────────┘
 ```
 
-A small Go MCP server speaks to your agent over stdio and opens a loopback
-WebSocket. A lightweight Chrome extension connects to it and executes the
-agent's code in the page you're currently viewing.
+A small Go MCP server speaks to your agent over stdio and connects to a local
+**hub** that the Chrome extension talks to. One hub, many agents, no port
+juggling — each opencode session is its own session and can be pinned to its
+own tab or window, so two agents can work in two browser windows at once
+without stepping on each other.
 
 ## Quick start
 
@@ -65,10 +67,46 @@ go build -o browser-mcp ./cmd/browser-mcp
 1. Load the `extension/` folder in `chrome://extensions` (Developer mode →
    Load unpacked).
 2. Click the extension icon and hit **Connect**.
-3. Point your agent at the binary (see `opencode.example.json`, or
-   `claude mcp add ...`).
+3. Add the MCP to your project (below).
 
 That's it. The extension reconnects on its own and keeps the connection alive.
+
+## Install for a project (local-only)
+
+Browser control is a per-project tool: installing it globally hands every
+agent on your machine a browser it'll be all too eager to drive. Keep it
+scoped to the projects that need it.
+
+**opencode** — add a project-scoped config. Either an `opencode.json` in the
+project root, or `.opencode/opencode.json` (this repo uses the latter; it's
+git-ignored here so your machine-specific binary path never gets committed):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "browser": {
+      "command": ["/abs/path/to/browser-mcp"],
+      "type": "local",
+      "enabled": true
+    }
+  }
+}
+```
+
+A ready-to-paste template lives in [`opencode.example.json`](opencode.example.json).
+
+**Claude Code** — register it for the project:
+
+```sh
+claude mcp add --scope project browser-mcp -- /abs/path/to/browser-mcp
+```
+
+(or drop a `.mcp.json` in the project root — see Claude Code's docs).
+
+If you're using the binary built in this repo, point the `command` at
+`/abs/path/to/browser-mcp` where you built it — or install it somewhere on
+`PATH` (e.g. `~/.local/bin/browser-mcp`) and reference that.
 
 Full setup, the tool reference, and troubleshooting live in
 [`docs/technical.md`](docs/technical.md).

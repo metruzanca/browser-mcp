@@ -14,21 +14,45 @@ Typical use: auto-filling job applications, background-check forms (dates, job
 titles, manager name/phone, addresses), extracting page text — anything where
 the agent brings the data and the browser has the form.
 
+## Architecture: hub + sessions
+
+One long-lived **hub** owns the single WebSocket to the Chrome extension.
+Every opencode session runs a `browser-mcp` agent that connects to the hub as
+a session; multiple agents coexist on the same fixed port — no per-session
+port juggling.
+
 ```
 Claude Code / opencode              Chrome browser
-      │  MCP over stdio                    │
-      ▼                                    ▼
-┌─────────────────────┐  WS 127.0.0.1  ┌──────────────────────────────┐
-│ Go MCP server        │ ◄──────────── │ extension (service worker)    │
-│  mcp-go + gorilla/ws │  req/resp     │  - owns WebSocket connection  │
-│  stdio transport     │               │  - chrome.scripting injection │
-│  bridge (ids+timeout)│               │  - popup (connect/status)     │
-└─────────────────────┘               └──────────────────────────────┘
+      │  MCP over stdio                   │
+      ▼                                   ▼
+┌──────────────┐  agent WS   ┌────────────────────┐  extension WS  ┌─────────────┐
+│ MCP instance │ ──────────► │  browser-mcp hub   │ ◄───────────── │ extension    │
+│ (stdio)      │ ──────────► │  (127.0.0.1:18765) │                │  (Chrome SW) │
+└──────────────┘  N agents   └────────────────────┘                └─────────────┘
 ```
 
-The MCP server speaks stdio to the agent and opens a loopback WebSocket
-(`ws://127.0.0.1:18765/ws`, configurable with `-port`) for the extension.
-One extension connection is served at a time; a new one replaces the old.
+- The hub is a detached daemon (`browser-mcp daemon`). The first MCP instance
+  to start spawns it automatically; it survives opencode sessions. Logs live in
+  `~/.local/state/browser-mcp/daemon-<port>.log`.
+- The hub routes each agent's requests to the extension and back, tagged with
+  the agent's session id, so two opencode sessions never cross wires.
+- If the extension is busy or Chrome restarts, the hub keeps agent connections
+  alive and the extension reconnects on its own.
+
+### Session targets (pinning)
+
+Each agent session can be **pinned** to a tab or a window. Until pinned, it
+acts on the active tab of the focused window (the classic single-session
+behavior). The recommended workflow:
+
+1. The agent calls `browser_get_tab` to see what's focused.
+2. The agent **confirms with the user** which tab it will work on.
+3. The agent pins it with `browser_set_target({tabId})` (or `{windowId}`).
+4. The user can browse elsewhere; the agent stays on the pinned tab.
+
+Pinning is enforced by the hub: a session pinned to tab 10 cannot act on tab
+999 (`browser_set_target`/`browser_get_target` manage the pin). This is what
+makes multiple windows with different tabs tractable — one agent per window.
 
 ## Quick start
 
@@ -49,30 +73,35 @@ go build -o browser-mcp ./cmd/browser-mcp
 
 The MCP server process must be running when you click Connect.
 
-### 3. Point your agent at the server
+### 3. Add the MCP to a project (local-only)
 
-**opencode** — add to `~/.config/opencode/opencode.json` (or see
-`opencode.example.json`):
+Keep it scoped to projects that need it — a global install gives every agent a
+browser to drive.
+
+**opencode** — add a project-scoped config. Either an `opencode.json` in the
+project root, or `.opencode/opencode.json`:
 
 ```json
-"mcp": {
-  "browser": {
-    "command": ["/abs/path/to/browser-mcp"],
-    "type": "local",
-    "enabled": true
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "browser": {
+      "command": ["/abs/path/to/browser-mcp"],
+      "type": "local",
+      "enabled": true
+    }
   }
 }
 ```
 
-**Claude Code**:
+**Claude Code** — register for the project:
 
 ```sh
-claude mcp add --scope user browser-mcp -- /abs/path/to/browser-mcp
+claude mcp add --scope project browser-mcp -- /abs/path/to/browser-mcp
 ```
 
-The extension connects on demand and reconnects automatically (every 20s
-keepalive keeps the service worker alive). If you close Chrome or reload the
-extension, just open the popup and click Connect again.
+The extension connects on demand and reconnects automatically. If you close
+Chrome or reload the extension, just open the popup and click Connect again.
 
 ## Tools
 
@@ -95,6 +124,10 @@ extension, just open the popup and click Connect again.
 | `browser_screenshot` | Capture the visible tab as a PNG image. |
 | `browser_run_snippet` | Run a reusable confirmed page script by name (see below). |
 | `browser_list_snippets` | List available snippets with descriptions. |
+| `browser_list_windows` | List Chrome windows (id, focused, active tab). |
+| `browser_list_tabs` | List tabs (all or one window) with ids/urls/titles. |
+| `browser_set_target` | Pin this session to a tab or window (`{tabId}`, `{windowId}`, or `{"clear":true}`). |
+| `browser_get_target` | Show this session's current pin. |
 
 `browser_type_text` / `browser_set_value` accept `returnSnapshot: true` to also
 get the whole form back in one call.
@@ -202,8 +235,10 @@ experiments. The shipped `atproto-qr.app/*` snippets were verified live.
 ## Project layout
 
 ```
-cmd/browser-mcp/main.go      flags, wires bridge + MCP server (stdio)
-internal/bridge/             loopback WS server, correlated req/resp, keepalive
+cmd/browser-mcp/main.go      agent (stdio) + daemon (hub) entry points
+internal/hub/                hub: extension + multi-agent WS, session pinning, routing
+internal/bridge/             agent client (dial hub, request/control, daemon spawn)
+internal/daemon/             detached hub-daemon lifecycle (pid file, spawn)
 internal/mcp/                tool definitions, handlers, canned snippets, snippet store
 extension/                   MV3 extension (background.js, popup, icons)
 snippets/                    reusable confirmed page scripts (site-scoped)
