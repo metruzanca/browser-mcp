@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Browser MCP",
+  "version": "1.0.0",
+  "description": "Connects the active browser tab to a local MCP server (browser-mcp) so agents like Claude Code or opencode can inspect and drive the page.",
+  "minimum_chrome_version": "116",
+  "permissions": ["scripting", "tabs", "storage"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Browser MCP",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
