@@ -111,6 +111,22 @@ If you're using the binary built in this repo, point the `command` at
 Full setup, the tool reference, and troubleshooting live in
 [`docs/technical.md`](docs/technical.md).
 
+## Give your agent the prompt
+
+Your agent needs to know *how* to use the browser: confirm the tab with you,
+pin it, then work JS-first. Paste this into your agent once (or whenever it
+seems unsure), or keep it in your project's `AGENTS.md`:
+
+> **Paste [`agent-prompt.md`](agent-prompt.md)** — a short, copy-paste set of
+> instructions that teaches the agent the confirm-then-pin workflow, the
+> `bmcp` helpers, and the ground rules.
+
+At a glance, it covers: always confirm which tab you'll work on and pin it
+with `browser_set_target` before acting; drive pages with `browser_execute_js`
+and `bmcp`; resolve fields by their visible labels; type (don't just set);
+highlight before touching; verify before submitting; and only ever touch the
+pinned target.
+
 ## Example
 
 Ask your agent: _"Fill out this form. The details are in those PDFs."_
@@ -130,8 +146,9 @@ await bmcp.type(el, args.phone, { clearFirst: true });
 ```
 cmd/browser-mcp/    the MCP server
 extension/          the Chrome extension
-internal/           bridge + tool implementations
+internal/           hub, agent client, tools
 snippets/           verified per-site page scripts
+agent-prompt.md     paste this into your agent
 docs/technical.md   the technical reference
 ```
 
