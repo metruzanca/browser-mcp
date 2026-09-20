@@ -182,12 +182,12 @@ func (h *Hub) extensionLoop(wc *wsConn) {
 	wc.c.SetReadDeadline(time.Now().Add(40 * time.Second))
 	for {
 		var env struct {
-			Type    string         `json:"type"`
-			ID      uint64         `json:"id"`
-			Session string         `json:"session"`
-			OK      bool           `json:"ok"`
-			Data    map[string]any `json:"data,omitempty"`
-			Error   string         `json:"error,omitempty"`
+			Type    string          `json:"type"`
+			ID      uint64          `json:"id"`
+			Session string          `json:"session"`
+			OK      bool            `json:"ok"`
+			Data    json.RawMessage `json:"data,omitempty"`
+			Error   string          `json:"error,omitempty"`
 		}
 		if err := wc.c.ReadJSON(&env); err != nil {
 			return

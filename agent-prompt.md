@@ -37,11 +37,26 @@ to it — that's by design.
 - Verify before submitting: `browser_get_value`, `browser_read_text`,
   `browser_screenshot`.
 
+## Files
+
+- **File uploads**: use `browser_upload_file(path, selector?)` — never inline
+  file bytes into tool args (they get truncated in transit).
+- `bmcp.setValue`/`bmcp.type` refuse file inputs with a "use
+  browser_upload_file" error; follow that guidance.
+
 ## Buttons and clicks
 
 - Click by visible text: `browser_click_button("Save changes")` or
   `bmcp.findByText('button', /save/i)`.
 - `browser_submit_form` for forms.
+
+## Dynamic rows
+
+Forms like "Add Experience" clone rows with **duplicate ids** — never target
+by `#id` there. Field listings return full, unambiguous CSS paths and flag
+`duplicateId: true`; scope queries to the row container instead
+(`bmcp.q(rowSelector).querySelector('[name="..."]')`, or the `fill-row`
+snippet).
 
 ## Reuse verified flows
 

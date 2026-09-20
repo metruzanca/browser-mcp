@@ -77,13 +77,14 @@ function connect() {
         return;
       }
       if (msg && msg.id && msg.action) {
-        // Hard per-request timeout: reply with an error instead of letting a
-        // hung executeScript burn the client's full timeout.
-        const REQ_TIMEOUT_MS = 12000;
+        // Per-request timeout: honor the caller's timeoutMs (so busy pages can
+        // be given more time), otherwise default to 20s. Reply with an error
+        // instead of letting a hung request burn the client's full timeout.
+        const reqTimeoutMs = (msg.params && msg.params.timeoutMs) || 20000;
         Promise.race([
           dispatch(msg),
           new Promise((_, reject) =>
-            setTimeout(() => reject(new Error("browser: request timed out after " + REQ_TIMEOUT_MS + "ms")), REQ_TIMEOUT_MS)
+            setTimeout(() => reject(new Error("browser: request timed out after " + reqTimeoutMs + "ms")), reqTimeoutMs)
           ),
         ]).then(
           (reply) => sendSafe(Object.assign({ id: msg.id, session: msg.session }, reply)),
@@ -420,14 +421,31 @@ const BMCP_RUNTIME = `
   if (window.__bmcp) return;
   var bmcp = {};
 
-  function cssPath(el) {
+  function idFrequency() {
+    var freq = {};
+    var all = document.querySelectorAll('[id]');
+    for (var i = 0; i < all.length; i++) {
+      var id = all[i].id;
+      if (id) freq[id] = (freq[id] || 0) + 1;
+    }
+    return freq;
+  }
+
+  // Unique CSS path. Short-circuits to #id only when that id is unique on the
+  // page; cloned rows (Add Experience, etc.) share ids, so those fall through
+  // to a full :nth-of-type path that stays unambiguous per row.
+  function cssPath(el, idFreq) {
     if (!el || el.nodeType !== 1) return '';
-    if (el.id) return '#' + CSS.escape(el.id);
+    if (!idFreq) idFreq = bmcp._idFreq || (bmcp._idFreq = idFrequency());
     var parts = [];
     var node = el;
     while (node && node.nodeType === 1 && node !== document.body && node !== document.documentElement) {
       var seg = node.tagName.toLowerCase();
-      if (node.id) { seg = '#' + CSS.escape(node.id); parts.unshift(seg); break; }
+      if (node.id && !(idFreq[node.id] > 1)) {
+        seg = '#' + CSS.escape(node.id);
+        parts.unshift(seg);
+        break;
+      }
       var parent = node.parentElement;
       if (parent) {
         var siblings = Array.prototype.filter.call(parent.children, function (c) { return c.tagName === node.tagName; });
@@ -459,16 +477,21 @@ const BMCP_RUNTIME = `
     return '';
   }
 
-  function deepQueryAll(sel, root) {
+  function deepQueryAll(sel, root, budget) {
     var results = [];
     var seen = new Set();
+    var work = 0;
     function walk(scope) {
+      if (budget && work >= budget) return;
       var items = scope.querySelectorAll(sel);
       for (var i = 0; i < items.length; i++) {
+        if (budget && work >= budget) return;
         if (!seen.has(items[i])) { seen.add(items[i]); results.push(items[i]); }
       }
       var all = scope.querySelectorAll('*');
       for (var j = 0; j < all.length; j++) {
+        if (budget && work >= budget) return;
+        work++;
         var el = all[j];
         if (el.shadowRoot) walk(el.shadowRoot);
         if (el.tagName === 'IFRAME') {
@@ -513,10 +536,11 @@ const BMCP_RUNTIME = `
 
   bmcp.info = function (el) {
     if (!el) return null;
+    var idf = bmcp._idFreq || (bmcp._idFreq = idFrequency());
     var tag = (el.tagName || '').toLowerCase();
     var o = {
       tag: tag,
-      selector: cssPath(el),
+      selector: cssPath(el, idf),
       id: el.id || '',
       name: (el.getAttribute && el.getAttribute('name')) || '',
       label: labelFor(el),
@@ -530,6 +554,8 @@ const BMCP_RUNTIME = `
       disabled: el.disabled !== undefined ? !!el.disabled : undefined,
       visible: bmcp.visible(el),
     };
+    if (el.id && idf[el.id] > 1) o.duplicateId = true;
+    if (el.type === 'file') o.fileInput = true;
     if (el.getAttribute && el.getAttribute('autocomplete')) o.autocomplete = el.getAttribute('autocomplete');
     if (el.maxLength !== undefined && el.maxLength >= 0) o.maxLength = el.maxLength;
     if (tag === 'select') {
@@ -544,7 +570,10 @@ const BMCP_RUNTIME = `
   bmcp.fields = function (scope, opts) {
     opts = opts || {};
     var root = scope ? (typeof scope === 'string' ? bmcp.q(scope) : scope) : document;
-    var els = deepQueryAll('input, textarea, select, button, [contenteditable="true"], [role="combobox"]', root);
+    // Fresh id frequency so dynamic rows re-resolve; bounded walk so heavy
+    // pages (giant forms, lots of shadow roots) don't hang the call.
+    bmcp._idFreq = idFrequency();
+    var els = deepQueryAll('input, textarea, select, button, [contenteditable="true"], [role="combobox"]', root, opts.maxWork || 25000);
     var out = [];
     var seen = new Set();
     for (var i = 0; i < els.length; i++) {
@@ -555,6 +584,7 @@ const BMCP_RUNTIME = `
       var t = (el.type || '').toLowerCase();
       if (t === 'hidden' && !opts.includeHidden) continue;
       out.push(bmcp.info(el));
+      if (opts.maxFields && out.length >= opts.maxFields) break;
     }
     return out;
   };
@@ -619,6 +649,9 @@ const BMCP_RUNTIME = `
       el.textContent = String(value);
       el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: String(value) }));
       return el.textContent;
+    }
+    if (el.type === 'file') {
+      throw new Error('file inputs cannot be set with setValue; use browser_upload_file (or bmcp.uploadFile)');
     }
     setNativeValue(el, String(value));
     el.dispatchEvent(new Event('input', { bubbles: true }));
@@ -716,6 +749,9 @@ const BMCP_RUNTIME = `
       bmcp.click(el);
       return true;
     }
+    if (el.type === 'file') {
+      throw new Error('file inputs cannot be typed into; use browser_upload_file (or bmcp.uploadFile)');
+    }
 
     var s = String(text);
     if (mode === 'native') {
@@ -766,6 +802,37 @@ const BMCP_RUNTIME = `
     if (el.type === 'checkbox' || el.type === 'radio') return el.checked;
     if (el.tagName === 'SELECT') return el.value;
     return el.value;
+  };
+
+  bmcp.uploadFile = function (b64, fileName, mimeType, selector) {
+    var input = null;
+    if (selector) input = bmcp.q(selector);
+    if (!input || input.type !== 'file') {
+      var focused = document.activeElement;
+      if (focused && focused.type === 'file') {
+        input = focused;
+      } else if (!input) {
+        var first = document.querySelector('input[type="file"]');
+        if (first) input = first;
+      }
+    }
+    if (!input) throw new Error('No file input found' + (selector ? ' for selector: ' + selector : ''));
+    if (input.type !== 'file') throw new Error('Selector does not point at a file input: ' + selector);
+
+    var bin = atob(b64);
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    var file = new File([bytes], fileName, { type: mimeType || 'application/octet-stream' });
+    var dt = new DataTransfer();
+    dt.items.add(file);
+    input.files = dt.files;
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    return {
+      files: input.files.length,
+      name: input.files[0] && input.files[0].name,
+      size: input.files[0] && input.files[0].size,
+      selector: cssPath(input),
+    };
   };
 
   bmcp.text = function (scope, maxChars) {

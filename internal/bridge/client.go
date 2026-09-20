@@ -5,6 +5,7 @@ package bridge
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -33,12 +34,13 @@ const (
 )
 
 // Reply is a correlated response from the hub (a proxied extension reply or a
-// control reply).
+// control reply). Data is raw JSON so string/number/array results from the page
+// survive intact instead of being forced into an object.
 type Reply struct {
-	ID    uint64         `json:"id"`
-	OK    bool           `json:"ok"`
-	Data  map[string]any `json:"data,omitempty"`
-	Error string         `json:"error,omitempty"`
+	ID    uint64          `json:"id"`
+	OK    bool            `json:"ok"`
+	Data  json.RawMessage `json:"data,omitempty"`
+	Error string          `json:"error,omitempty"`
 }
 
 // Client dials the hub as an agent session and proxies requests to the
@@ -282,11 +284,11 @@ func (c *Client) readLoop(wc *wsConn) {
 
 	for {
 		var env struct {
-			Type  string         `json:"type"`
-			ID    uint64         `json:"id"`
-			OK    bool           `json:"ok"`
-			Data  map[string]any `json:"data,omitempty"`
-			Error string         `json:"error,omitempty"`
+			Type  string          `json:"type"`
+			ID    uint64          `json:"id"`
+			OK    bool            `json:"ok"`
+			Data  json.RawMessage `json:"data,omitempty"`
+			Error string          `json:"error,omitempty"`
 		}
 		if err := wc.c.ReadJSON(&env); err != nil {
 			return

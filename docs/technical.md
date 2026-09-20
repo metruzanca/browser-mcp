@@ -122,6 +122,7 @@ Chrome or reload the extension, just open the popup and click Connect again.
 | `browser_wait` | Sleep, or poll until a selector appears. |
 | `browser_highlight` | Flash an outline around an element (trust UX). |
 | `browser_screenshot` | Capture the visible tab as a PNG image. |
+| `browser_upload_file` | Upload a local file by path to an `<input type="file">` (DataTransfer + change event). |
 | `browser_run_snippet` | Run a reusable confirmed page script by name (see below). |
 | `browser_list_snippets` | List available snippets with descriptions. |
 | `browser_list_windows` | List Chrome windows (id, focused, active tab). |
@@ -199,6 +200,9 @@ the site it targets (e.g. `snippets/atproto-qr.app/create-dynamic.js`), with a
 - `browser_run_snippet(name, args)` — run one (lookup order: env, user config,
   binary dir, `./snippets`).
 
+Snippets must `return` a value; the returned JSON is surfaced to the agent
+(exactly like `browser_execute_js`).
+
 Only add a snippet once a flow is verified end to end — confirmed recipes, not
 experiments. The shipped `atproto-qr.app/*` snippets were verified live.
 
@@ -215,13 +219,31 @@ experiments. The shipped `atproto-qr.app/*` snippets were verified live.
   `__truncated` marker rather than blowing up your context.
 - **Unsupported pages**: `chrome://`, the Chrome Web Store, and PDF viewers
   reject injection — the error tells you to navigate to a normal page.
-- **Timeouts fail fast**: the extension replies with an error after ~12s instead
-  of hanging, and the Go bridge resets the connection when a request times out
-  so the next call starts fresh. A timed-out read is safe to retry; a timed-out
-  write may have landed, so the agent decides rather than auto-retrying.
+- **Timeouts fail fast, reads retry once**: the extension replies with an error
+  after ~20s (per-call `timeoutMs` overrides) instead of hanging, and the Go
+  bridge resets the connection when a request times out so the next call
+  starts fresh. Read-only actions (`browser_get_tab`, `browser_list_fields`,
+  `browser_read_text`, `browser_get_value`, `browser_snapshot`,
+  `browser_list_windows`, `browser_list_tabs`, `browser_wait`,
+  `browser_highlight`, `browser_find`, and `browser_execute_js` with
+  `readonly: true`) retry once with a short backoff on transient timeouts.
+  Writes (`browser_type_text`, `browser_set_value`, `browser_click`,
+  `browser_submit_form`, `browser_upload_file`, plain `browser_execute_js`)
+  fail fast so nothing double-fires.
 - **Service worker**: the extension keeps the MV3 service worker alive with a
   10s keepalive. If Chrome force-kills it anyway, the extension reconnects and
   tools recover on the next call.
+- **File inputs**: `bmcp.setValue`/`bmcp.type` refuse file inputs with a clear
+  "use browser_upload_file" error. Uploads read the file in the daemon and ship
+  the bytes over the extension channel, so large blobs never travel through
+  MCP tool arguments (default limit 20MB, `BROWSER_MCP_MAX_UPLOAD`).
+- **Payload size**: `browser_execute_js` / `browser_run_snippet` reject
+  `code`+`args` over 128KB (`BROWSER_MCP_MAX_ARGS`) with a clear error. Big
+  data should go through `browser_upload_file` or a file path, never inline
+  tool args — large args can be silently truncated by the agent transport.
+- **Duplicate ids (dynamic rows)**: selectors in field listings are full,
+  unambiguous CSS paths — the `#id` shortcut is only used when the id is
+  unique on the page. Fields whose id is duplicated carry `duplicateId: true`.
 
 ## Troubleshooting
 

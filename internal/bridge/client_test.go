@@ -2,12 +2,22 @@ package bridge
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/metruzanca/browser-mcp/internal/hub"
 )
+
+func dataMap(t *testing.T, r json.RawMessage) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(r, &m); err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
 
 // startHubWithExtension starts an in-process hub and attaches a fake
 // extension that echoes requests back with their session.
@@ -65,7 +75,7 @@ func TestClientRequestRoundTrip(t *testing.T) {
 	if !rep.OK {
 		t.Fatalf("not ok: %+v", rep)
 	}
-	data := rep.Data
+	data := dataMap(t, rep.Data)
 	if data["action"] != "getTabInfo" {
 		t.Fatalf("wrong action echoed: %v", data)
 	}
@@ -88,7 +98,7 @@ func TestClientSetTargetAndGetTarget(t *testing.T) {
 	if err != nil || !rep.OK {
 		t.Fatalf("getTarget failed: %v %+v", err, rep)
 	}
-	tgt := rep.Data["target"].(map[string]any)
+	tgt := dataMap(t, rep.Data)["target"].(map[string]any)
 	if tgt["kind"] != "tab" || tgt["id"] != float64(99) {
 		t.Fatalf("target wrong: %v", tgt)
 	}
@@ -98,7 +108,7 @@ func TestClientSetTargetAndGetTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	params := rep.Data["params"].(map[string]any)
+	params := dataMap(t, rep.Data)["params"].(map[string]any)
 	if params["tabId"] != float64(99) || params["pinnedTab"] != float64(99) {
 		t.Fatalf("pin not forced: %v", params)
 	}
@@ -148,8 +158,8 @@ func TestClientTwoAgents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pa := ra.Data["params"].(map[string]any)
-	pb := rb.Data["params"].(map[string]any)
+	pa := dataMap(t, ra.Data)["params"].(map[string]any)
+	pb := dataMap(t, rb.Data)["params"].(map[string]any)
 	if pa["tabId"] != float64(1) || pb["tabId"] != float64(2) {
 		t.Fatalf("session pins crossed: a=%v b=%v", pa, pb)
 	}

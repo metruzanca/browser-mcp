@@ -6,7 +6,9 @@ package mcp
 
 const snippetListFields = `return bmcp.fields(args.selector || null, {
   includeHidden: !!args.includeHidden,
-  includeDisabled: !!args.includeDisabled
+  includeDisabled: !!args.includeDisabled,
+  maxFields: args.maxFields || 100,
+  maxWork: args.maxWork || 25000
 });`
 
 const snippetTypeText = `const el = bmcp.q(args.selector);
@@ -82,3 +84,5 @@ const snippetClickButton = `const el = bmcp.findByText(args.scope || 'button, [r
 if (args.highlightMs) bmcp.highlight(el, { ms: args.highlightMs, color: args.color || '#22c55e' });
 bmcp.click(el);
 return bmcp.info(el);`
+
+const snippetUploadFile = `return bmcp.uploadFile(args.b64, args.fileName, args.mimeType, args.selector || null);`

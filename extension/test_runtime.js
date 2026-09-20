@@ -206,5 +206,40 @@ check("snapshot buttons populated", Array.isArray(snap.buttons) && snap.buttons.
 check("snapshot text string", typeof snap.text === "string");
 check("snapshot fields array", Array.isArray(snap.fields));
 
+// --- duplicate ids / dynamic rows ---
+function makeRow(id) {
+  const row = new FakeEl("div");
+  const input = new FakeEl("input", { id, type: "text" });
+  row.children = [input];
+  input.parentElement = row;
+  row.parentElement = fakeBody;
+  return { row, input };
+}
+const r1 = makeRow("title");
+const r2 = makeRow("title");
+fakeBody.children = [r1.row, r2.row];
+documentMock.querySelectorAll = (sel) => {
+  if (sel === "[id]" || sel.includes("input")) return [r1.input, r2.input];
+  if (sel === "h1, h2, h3") return [];
+  return [];
+};
+fakeBody.querySelectorAll = documentMock.querySelectorAll;
+bmcp._idFreq = null;
+const dupInfo = bmcp.info(r2.input);
+check("duplicate id flagged", dupInfo.duplicateId === true);
+check("duplicate id gets full path", dupInfo.selector === "div:nth-of-type(2) > input");
+const capped = bmcp.fields(null, { maxFields: 1 });
+check("fields maxFields cap", capped.length === 1);
+
+// --- file input guidance ---
+const fileInput = new FakeEl("input", { type: "file" });
+let fileErr = null;
+try {
+  bmcp.setValue(fileInput, "x");
+} catch (e) {
+  fileErr = e && e.message;
+}
+check("setValue file branch gives guidance", /file inputs/.test(fileErr || ""));
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

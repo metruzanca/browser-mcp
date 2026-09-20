@@ -1,11 +1,15 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,9 +40,29 @@ const (
 	toolGetTarget    = "browser_get_target"
 	toolListWindows  = "browser_list_windows"
 	toolListTabs     = "browser_list_tabs"
+	toolUploadFile   = "browser_upload_file"
 )
 
 const defaultTimeout = 20 * time.Second
+
+const retryBackoff = 1 * time.Second
+
+// maxArgBytes guards browser_execute_js / browser_run_snippet payloads so a
+// big blob doesn't silently corrupt in transit upstream. Keep blobs out of
+// tool args; use browser_upload_file.
+var maxArgBytes = envInt("BROWSER_MCP_MAX_ARGS", 128*1024)
+
+// maxUploadBytes caps browser_upload_file file size.
+var maxUploadBytes = envInt("BROWSER_MCP_MAX_UPLOAD", 20*1024*1024)
+
+func envInt(name string, def int) int {
+	if v := os.Getenv(name); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	return def
+}
 
 // Server wires MCP tools to the agent client that talks to the hub.
 type Server struct {
@@ -73,7 +97,10 @@ func (s *Server) Register(mcpServer *server.MCPServer) {
 				mcp.Description("Which JS world to run in: \"main\" (default, sees page globals and page frameworks) or \"isolated\" (immune to page CSP). Falls back to isolated automatically if the page CSP blocks main."),
 			),
 			mcp.WithNumber("timeoutMs",
-				mcp.Description("Milliseconds to wait for the script to finish. Default 60000. Chrome force-kills long-running service-worker work around 5 minutes."),
+				mcp.Description("Milliseconds to wait for the script to finish. Default 20000. Chrome force-kills long-running service-worker work around 5 minutes."),
+			),
+			mcp.WithBoolean("readonly",
+				mcp.Description("Mark this script as read-only so a transient timeout is retried once automatically. Set true only when the script has no side effects. Default false."),
 			),
 			mcp.WithNumber("tabId",
 				mcp.Description("Chrome tab id to target. Omit to use the active tab of the focused window."),
@@ -237,6 +264,18 @@ func (s *Server) Register(mcpServer *server.MCPServer) {
 	)
 
 	mcpServer.AddTool(
+		mcp.NewTool(toolUploadFile,
+			mcp.WithDescription("Upload a local file to a <input type=\"file\"> on the page. The daemon reads the file by path (so large blobs never travel through tool arguments), ships it to the page, sets input.files via DataTransfer and dispatches change — the way frameworks like Gild expect. Pass `selector` to target a specific file input; otherwise the focused file input or the first one on the page is used."),
+			mcp.WithString("path", mcp.Required(), mcp.Description("Absolute path to the local file to upload.")),
+			mcp.WithString("selector", mcp.Description("CSS selector for the file input. Optional: focused file input, else first input[type=file].")),
+			mcp.WithString("mimeType", mcp.Description("MIME type for the uploaded file. Optional; defaults to application/octet-stream.")),
+			mcp.WithNumber("timeoutMs", mcp.Description("Milliseconds to wait. Default 20000.")),
+			mcp.WithNumber("tabId", mcp.Description("Chrome tab id. Omit to use the active tab.")),
+		),
+		s.handleUploadFile,
+	)
+
+	mcpServer.AddTool(
 		mcp.NewTool(toolRunSnippet,
 			mcp.WithDescription("Run a reusable, pre-confirmed page script by name (see browser_list_snippets). Snippets are plain JS files that use the same runner as browser_execute_js, so `args` and `bmcp` are in scope and `await` works. Lookup order: $BROWSER_MCP_SNIPPETS, ~/.config/browser-mcp/snippets/, the snippets/ dir next to the binary, ./snippets."),
 			mcp.WithString("name", mcp.Required(), mcp.Description("Snippet name, e.g. \"atproto-qr.app/save-dynamic\". Site-scoped snippets are named after the host.")),
@@ -297,24 +336,45 @@ func (s *Server) handleExecuteJS(ctx context.Context, req mcp.CallToolRequest) (
 	if err != nil {
 		return mcp.NewToolResultError("code is required"), nil
 	}
+	var args map[string]any
+	if a, ok := req.GetArguments()["args"].(map[string]any); ok {
+		args = a
+	}
+	if err := guardPayload(code, args); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 	params := map[string]any{
 		"code":  code,
 		"world": req.GetString("world", "main"),
 	}
-	if args, ok := req.GetArguments()["args"].(map[string]any); ok {
+	if args != nil {
 		params["args"] = args
 	}
 	if ms := req.GetInt("timeoutMs", 0); ms > 0 {
 		params["timeoutMs"] = ms
 	}
-	if tabID := req.GetInt("tabId", 0); tabID > 0 {
-		params["tabId"] = tabID
+	if req.GetBool("readonly", false) {
+		return s.callTabRead(ctx, "executeScript", req, params)
 	}
-	return s.call(ctx, "executeScript", params)
+	return s.callTab(ctx, "executeScript", req, params)
 }
 
 func (s *Server) handleGetTab(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return s.callTab(ctx, "getTabInfo", req, nil)
+	return s.callTabRead(ctx, "getTabInfo", req, nil)
+}
+
+// guardPayload rejects tool payloads over the arg limit so oversized blobs
+// fail loudly instead of corrupting in transit upstream. Keep blobs out of
+// args; use browser_upload_file or pass file paths.
+func guardPayload(code string, args map[string]any) error {
+	size := len(code)
+	if b, err := json.Marshal(args); err == nil {
+		size += len(b)
+	}
+	if size > maxArgBytes {
+		return fmt.Errorf("payload too large (%d bytes; limit %d) — don't inline blobs into args; use browser_upload_file or pass a file path", size, maxArgBytes)
+	}
+	return nil
 }
 
 func (s *Server) handleListFields(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -324,8 +384,14 @@ func (s *Server) handleListFields(ctx context.Context, req mcp.CallToolRequest) 
 	}
 	params["includeHidden"] = req.GetBool("includeHidden", false)
 	params["includeDisabled"] = req.GetBool("includeDisabled", false)
+	if v := req.GetInt("maxFields", 0); v > 0 {
+		params["maxFields"] = v
+	}
+	if v := req.GetInt("maxWork", 0); v > 0 {
+		params["maxWork"] = v
+	}
 	params["code"] = snippetListFields
-	return s.callTab(ctx, "executeScript", req, params)
+	return s.callTabRead(ctx, "executeScript", req, params)
 }
 
 func (s *Server) handleTypeText(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -383,7 +449,7 @@ func (s *Server) handleGetValue(ctx context.Context, req mcp.CallToolRequest) (*
 		"code": snippetGetValue,
 		"args": map[string]any{"selector": sel},
 	}
-	return s.callTab(ctx, "executeScript", req, params)
+	return s.callTabRead(ctx, "executeScript", req, params)
 }
 
 func (s *Server) handleReadText(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -395,7 +461,7 @@ func (s *Server) handleReadText(ctx context.Context, req mcp.CallToolRequest) (*
 		args["maxChars"] = mc
 	}
 	params := map[string]any{"code": snippetReadText, "args": args}
-	return s.callTab(ctx, "executeScript", req, params)
+	return s.callTabRead(ctx, "executeScript", req, params)
 }
 
 func (s *Server) handleClick(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -434,7 +500,7 @@ func (s *Server) handleWait(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		args["intervalMs"] = im
 	}
 	params := map[string]any{"code": snippetWait, "args": args}
-	return s.callTab(ctx, "executeScript", req, params)
+	return s.callTabRead(ctx, "executeScript", req, params)
 }
 
 func (s *Server) handleHighlight(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -450,7 +516,7 @@ func (s *Server) handleHighlight(ctx context.Context, req mcp.CallToolRequest) (
 			"color":    req.GetString("color", "#ff3b30"),
 		},
 	}
-	return s.callTab(ctx, "executeScript", req, params)
+	return s.callTabRead(ctx, "executeScript", req, params)
 }
 
 func (s *Server) handleSnapshot(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -464,7 +530,7 @@ func (s *Server) handleSnapshot(ctx context.Context, req mcp.CallToolRequest) (*
 	if v := req.GetInt("maxText", 0); v > 0 {
 		args["maxText"] = v
 	}
-	return s.callTab(ctx, "executeScript", req, map[string]any{"code": snippetSnapshot, "args": args})
+	return s.callTabRead(ctx, "executeScript", req, map[string]any{"code": snippetSnapshot, "args": args})
 }
 
 func (s *Server) handleFind(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -490,7 +556,7 @@ func (s *Server) handleFind(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	if len(args) == 0 {
 		return mcp.NewToolResultError("provide one of selector, label, or text"), nil
 	}
-	return s.callTab(ctx, "executeScript", req, map[string]any{"code": snippetFind, "args": args})
+	return s.callTabRead(ctx, "executeScript", req, map[string]any{"code": snippetFind, "args": args})
 }
 
 func (s *Server) handleClickButton(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -516,24 +582,57 @@ func (s *Server) handleScreenshot(ctx context.Context, req mcp.CallToolRequest) 
 	if tabID := req.GetInt("tabId", 0); tabID > 0 {
 		params["tabId"] = tabID
 	}
+	if tm := req.GetInt("timeoutMs", 0); tm > 0 {
+		params["timeoutMs"] = tm
+	}
 	cctx, cancel := context.WithTimeout(ctx, defaultTimeout)
 	defer cancel()
 	reply, err := s.br.Request(cctx, "captureTab", params)
 	if err != nil {
-		if err == bridge.ErrNotConnected {
-			return notConnectedResult(), nil
-		}
-		return mcp.NewToolResultError("Browser bridge error: " + err.Error()), nil
+		return s.mapError(err), nil
 	}
 	if !reply.OK {
+		if reply.Error == bridge.ErrNoExtension.Error() {
+			return notConnectedResult(), nil
+		}
 		return mcp.NewToolResultError(reply.Error), nil
 	}
-	dataURL, _ := reply.Data["dataUrl"].(string)
-	b64 := strings.TrimPrefix(dataURL, "data:image/png;base64,")
+	var d struct {
+		DataURL string `json:"dataUrl"`
+	}
+	if err := json.Unmarshal(reply.Data, &d); err != nil {
+		return mcp.NewToolResultError("capture failed: " + err.Error()), nil
+	}
+	b64 := strings.TrimPrefix(d.DataURL, "data:image/png;base64,")
 	if _, err := base64.StdEncoding.DecodeString(b64); err != nil {
 		return mcp.NewToolResultError("capture failed: " + err.Error()), nil
 	}
 	return &mcp.CallToolResult{Content: []mcp.Content{mcp.ImageContent{Type: "image", Data: b64, MIMEType: "image/png"}}}, nil
+}
+
+func (s *Server) handleUploadFile(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	path, err := req.RequireString("path")
+	if err != nil {
+		return mcp.NewToolResultError("path is required"), nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return mcp.NewToolResultError("read file: " + err.Error()), nil
+	}
+	if len(data) > maxUploadBytes {
+		return mcp.NewToolResultError(fmt.Sprintf("file is %d bytes; upload limit is %d", len(data), maxUploadBytes)), nil
+	}
+	b64 := base64.StdEncoding.EncodeToString(data)
+	params := map[string]any{
+		"code": snippetUploadFile,
+		"args": map[string]any{
+			"b64":      b64,
+			"fileName": filepath.Base(path),
+			"mimeType": req.GetString("mimeType", ""),
+			"selector": req.GetString("selector", ""),
+		},
+	}
+	return s.callTab(ctx, "executeScript", req, params)
 }
 
 func (s *Server) handleRunSnippet(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -541,18 +640,24 @@ func (s *Server) handleRunSnippet(ctx context.Context, req mcp.CallToolRequest) 
 	if err != nil {
 		return mcp.NewToolResultError("name is required"), nil
 	}
-	code, path, err := resolveSnippet(name)
+	code, _, err := resolveSnippet(name)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	var args map[string]any
+	if a, ok := req.GetArguments()["args"].(map[string]any); ok {
+		args = a
+	}
+	if err := guardPayload(code, args); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 	params := map[string]any{"code": code, "world": req.GetString("world", "main")}
-	if args, ok := req.GetArguments()["args"].(map[string]any); ok {
+	if args != nil {
 		params["args"] = args
 	}
 	if ms := req.GetInt("timeoutMs", 0); ms > 0 {
 		params["timeoutMs"] = ms
 	}
-	_ = path
 	return s.callTab(ctx, "executeScript", req, params)
 }
 
@@ -572,7 +677,7 @@ func (s *Server) handleListSnippets(ctx context.Context, req mcp.CallToolRequest
 }
 
 func (s *Server) handleListWindows(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return s.callTab(ctx, "listWindows", req, nil)
+	return s.callTabRead(ctx, "listWindows", req, nil)
 }
 
 func (s *Server) handleListTabs(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -580,7 +685,7 @@ func (s *Server) handleListTabs(ctx context.Context, req mcp.CallToolRequest) (*
 	if w := req.GetInt("windowId", 0); w > 0 {
 		params["windowId"] = w
 	}
-	return s.callTab(ctx, "listTabs", req, params)
+	return s.callTabRead(ctx, "listTabs", req, params)
 }
 
 func (s *Server) handleSetTarget(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -609,25 +714,90 @@ func notConnectedResult() *mcp.CallToolResult {
 	return mcp.NewToolResultError("No browser extension is connected. Open the extension popup in Chrome and click Connect (default ws://127.0.0.1:18765/ws), then try again.")
 }
 
-// call sends an action to the extension and formats the reply for MCP.
+// timeoutFor returns the per-call timeout from params, falling back to the
+// default.
+func (s *Server) timeoutFor(params map[string]any) time.Duration {
+	switch v := params["timeoutMs"].(type) {
+	case int:
+		if v > 0 {
+			return time.Duration(v) * time.Millisecond
+		}
+	case float64:
+		if v > 0 {
+			return time.Duration(v) * time.Millisecond
+		}
+	case json.Number:
+		if n, err := v.Int64(); err == nil && n > 0 {
+			return time.Duration(n) * time.Millisecond
+		}
+	}
+	return defaultTimeout
+}
+
+// isTransientTimeout reports whether a reply/error means "the page was too
+// busy or the extension was waking up" — safe to retry for read-only actions.
+func isTransientTimeout(errText string) bool {
+	return strings.Contains(errText, "timed out") || strings.Contains(errText, "did not respond in time")
+}
+
+// call sends an action to the extension (write path, no auto-retry).
 func (s *Server) call(ctx context.Context, action string, params map[string]any) (*mcp.CallToolResult, error) {
-	cctx, cancel := context.WithTimeout(ctx, defaultTimeout)
+	res, _ := s.callOnce(ctx, action, params)
+	return res, nil
+}
+
+// callRead sends an action and retries once after a short backoff on a
+// transient timeout. Only safe for read-only actions.
+func (s *Server) callRead(ctx context.Context, action string, params map[string]any) (*mcp.CallToolResult, error) {
+	res, timedOut := s.callOnce(ctx, action, params)
+	if timedOut {
+		select {
+		case <-ctx.Done():
+			return res, nil
+		case <-time.After(retryBackoff):
+		}
+		res, _ = s.callOnce(ctx, action, params)
+	}
+	return res, nil
+}
+
+// callOnce performs a single attempt, returning the result and whether it
+// timed out transiently.
+func (s *Server) callOnce(ctx context.Context, action string, params map[string]any) (*mcp.CallToolResult, bool) {
+	cctx, cancel := context.WithTimeout(ctx, s.timeoutFor(params))
 	defer cancel()
 	reply, err := s.br.Request(cctx, action, params)
 	if err != nil {
-		return s.mapError(err), nil
+		if errors.Is(err, context.DeadlineExceeded) {
+			return s.mapError(err), true
+		}
+		return s.mapError(err), false
 	}
 	if !reply.OK {
 		if reply.Error == bridge.ErrNoExtension.Error() {
-			return notConnectedResult(), nil
+			return notConnectedResult(), false
 		}
-		return mcp.NewToolResultError(reply.Error), nil
+		if isTransientTimeout(reply.Error) {
+			return mcp.NewToolResultError(reply.Error), true
+		}
+		return mcp.NewToolResultError(reply.Error), false
 	}
-	return renderResult(reply.Data), nil
+	return renderResult(reply.Data), false
 }
 
-// callTab merges tabId/windowId params into params before calling.
+// callTab merges tabId/windowId/timeoutMs params into params before calling
+// (write path, no auto-retry).
 func (s *Server) callTab(ctx context.Context, action string, req mcp.CallToolRequest, params map[string]any) (*mcp.CallToolResult, error) {
+	return s.callTabMode(ctx, action, req, params, false)
+}
+
+// callTabRead is callTab for read-only actions: transient timeouts are
+// retried once.
+func (s *Server) callTabRead(ctx context.Context, action string, req mcp.CallToolRequest, params map[string]any) (*mcp.CallToolResult, error) {
+	return s.callTabMode(ctx, action, req, params, true)
+}
+
+func (s *Server) callTabMode(ctx context.Context, action string, req mcp.CallToolRequest, params map[string]any, read bool) (*mcp.CallToolResult, error) {
 	if params == nil {
 		params = map[string]any{}
 	}
@@ -636,6 +806,12 @@ func (s *Server) callTab(ctx context.Context, action string, req mcp.CallToolReq
 	}
 	if windowID := req.GetInt("windowId", 0); windowID > 0 {
 		params["windowId"] = windowID
+	}
+	if tm := req.GetInt("timeoutMs", 0); tm > 0 {
+		params["timeoutMs"] = tm
+	}
+	if read {
+		return s.callRead(ctx, action, params)
 	}
 	return s.call(ctx, action, params)
 }
@@ -671,13 +847,13 @@ func (s *Server) mapError(err error) *mcp.CallToolResult {
 	}
 }
 
-func renderResult(data map[string]any) *mcp.CallToolResult {
-	if data == nil {
+func renderResult(data json.RawMessage) *mcp.CallToolResult {
+	if len(data) == 0 || string(data) == "null" {
 		return mcp.NewToolResultText("ok")
 	}
-	b, err := json.MarshalIndent(data, "", "  ")
-	if err != nil {
-		return mcp.NewToolResultText(fmt.Sprintf("%v", data))
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, data, "", "  "); err != nil {
+		return mcp.NewToolResultText(string(data))
 	}
-	return mcp.NewToolResultText(string(b))
+	return mcp.NewToolResultText(buf.String())
 }
